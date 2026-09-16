@@ -38,6 +38,8 @@
 - GPU AUTO/MANUAL/TURBO: `0x10` / `0x30` / `0x20`.
 - RPM registers: CPU `0x13`/`0x14`, GPU `0x15`/`0x16`.
   Decode CPU as `(EC[0x14] << 8) | EC[0x13]`, GPU analogously.
+- Routine PWM write messages use `nitro_dbg` instead of unconditional `dev_info`.
+  Probe/lifecycle, mode-change, warning, and error logging remain unchanged.
 - PWM scaling intentionally maps hwmon `0–255` to EC raw `0–100`.
   Read: `raw * 255 / 100`; write: `val * 100 / 255` (integer arithmetic).
 - Mode values are shared across current model maps. Lifecycle code must use
@@ -135,7 +137,24 @@
 - `nitro-fan-toggle` is installed as `/usr/local/bin/nitro-fan-toggle`.
   It checks service activity: inactive -> gaming via `nitro-fan-gaming-start`;
   active -> AUTO via `nitro-fan-auto`. It reuses the existing helpers without
-  duplicating fan-control logic. Both toggle directions were functionally tested.
+  duplicating fan-control logic. The hardened toggle was installed to that path
+  and runtime-validated successfully; `cmp` confirmed the repository and installed
+  `nitro-fan-toggle` matched (user-reported validation).
+- Toggle checks both `systemctl is-active` status and output: `0:active` -> AUTO,
+  `3:inactive` -> gaming. Query errors, failed/transitional states, and unexpected
+  responses return nonzero without invoking either helper.
+- Toggle uses non-blocking `flock` on `/run/user/$UID/nitro-fan-toggle.lock`,
+  separate from `/run/nitro-fan.lock`. It requires the desktop user's owned,
+  writable runtime directory; contention exits harmlessly without acting.
+  The parent holds the lock through helper completion and closes the inherited
+  descriptor in the helper child. The lock releases on exit; do not unlink its
+  file. Serialization is per-user, not across users or independent helper calls.
+- Rapid sequential toggles within 750 ms of successful helper completion exit
+  harmlessly without invoking either helper. Separate per-user debounce state
+  lives at `/run/user/$UID/nitro-fan-toggle.last-success`, using `/proc/uptime`
+  (boot-relative, 10 ms precision) rather than wall-clock time. The existing
+  toggle lock protects the check/update; query/helper failures do not update
+  the timestamp, and helper failures preserve their nonzero exit status.
 - The physical Nitro key is detected by keyd as F16 on
   `AT Translated Set 2 keyboard`, id `0001:0001:093d12dc`.
   keyd remaps `f16` -> `f24`; KDE binds F24 to
@@ -190,6 +209,23 @@
 - No MAX mode or CPU/GPU stress testing was used in this latest validation.
   Earlier MAX and suspend/resume results above are separate historical tests.
 
+## Latest hardening runtime validation
+- These completed runtime results are user-reported; they do not authorize
+  repeating hardware tests or changing the installed setup.
+- Concurrent two-process toggle invocation was tested: exactly one toggle
+  action proceeded, while the overlapping invocation reported
+  "Another toggle is in progress." Final service/fan state was consistent.
+- Physical Nitro-key rapid double press was tested: the first press entered
+  MANUAL/gaming, the second rapid press within the 750 ms debounce window was
+  ignored, and another press after about one second returned both fans to AUTO.
+- The driver with routine PWM logging moved behind `nitro_dbg` was rebuilt and
+  reinstalled through DKMS for both `7.2.5-1-cachyos` and
+  `6.18.50-1-cachyos-lts`. The current 7.2.5 module was reloaded; its loaded
+  srcversion was `7738B727383C0017DB7A471`, superseding the earlier safety-fix
+  build `93157E421BCC9E0D57660DD`. The signer remained `Database Key`.
+- Gaming service was run briefly. Journal checks for "fan speed set" produced
+  no routine PWM messages, and both fans ended in AUTO.
+
 ## Safety rules for future work
 - Do not use `ec_sys` concurrently with `acer_nitro_ec`.
 - Discover hwmon by `name=acer_nitro_ec`; never hardcode a `hwmonX` number.
@@ -218,9 +254,10 @@
   older tag with a release of the completed setup.
 
 ## Next planned work
-- Address remaining non-blocking audit hardening items in the next session:
-  routine PWM `dev_info` logging; `nitro-fan-toggle` activity-query error
-  handling; possible concurrent toggle serialization; optional service-readiness
-  improvement; and minor documentation/comment cleanup.
+- Completed: routine PWM logging hardening, concurrency serialization, and
+  750 ms debounce are implemented and runtime-validated. Toggle query-error
+  handling is completed and covered by mocked tests.
+- Remaining non-blocking audit items: optional service-readiness improvement
+  and minor documentation/comment cleanup.
 - Then perform the final release audit and decide the release/tag strategy,
   accounting for the existing older `v1.0.0` tag. Do not tag automatically.

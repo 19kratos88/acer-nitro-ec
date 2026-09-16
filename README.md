@@ -199,8 +199,26 @@ fallback if PWM refreshes stop.
 | `nitro-fan-toggle` | Inactive service -> gaming; active service -> AUTO |
 
 Start/stop helpers call `/usr/bin/systemctl --system` directly, without `pkexec`.
-The toggle checks `systemctl --system is-active --quiet` and delegates to the
-existing helpers; it does not duplicate fan control or write sysfs directly.
+The toggle checks both the exit status and text from `systemctl --system is-active`:
+only `0:active` selects AUTO and `3:inactive` selects gaming. Query failures,
+failed/transitional states, or unexpected responses fail without invoking either
+helper. It delegates fan control to the existing helpers without direct sysfs writes.
+
+Toggle invocations for the same desktop user are serialized with a non-blocking
+`flock` on `/run/user/$UID/nitro-fan-toggle.lock`, separate from the controller's
+`/run/nitro-fan.lock`. The user runtime directory must exist and be owned/writable
+by that user; run the toggle as the desktop user. A concurrent invocation exits
+harmlessly without acting. The parent holds the lock through helper completion;
+helpers/notification children do not inherit it. The lock releases on exit, and
+the lock file is retained. This does not serialize different users or independent
+start/stop helper calls.
+
+Rapid sequential presses within 750 ms of successful helper completion are
+ignored with exit status 0. A separate per-user state file,
+`/run/user/$UID/nitro-fan-toggle.last-success`, records boot-relative uptime
+(10 ms precision), independent of wall-clock changes. The existing lock protects
+both the cooldown check and update. Query/helper failures do not update this
+timestamp; helper failures retain their nonzero exit status.
 
 After installing the launchers, KDE offers **Nitro Fans: Gaming**, **Nitro Fans:
 Auto**, and **Nitro Fans: Toggle**. Desktop launchers and the helper commands
@@ -293,6 +311,8 @@ PWM readback may differ slightly from the requested value because both
 0–255 <-> 0–100 conversions truncate: requesting 178 writes raw 69, which reads
 back as 175. This is expected and is not evidence that the curve failed.
 
+Routine PWM write messages use `nitro_dbg` and are debug-only by default;
+mode changes, lifecycle messages, and actual errors retain their existing logging.
 For driver logging, load with `sudo modprobe acer-nitro-ec debug=1` when the
 module is not already loaded, or enable dynamic debug without reloading:
 

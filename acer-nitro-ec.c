@@ -471,7 +471,7 @@ static int nitro_hwmon_write_locked(struct device *dev, enum hwmon_sensor_types 
 				return -EINVAL;
 			/* Scale hwmon 0-255 to raw EC 0-100 */
 			ec_val = (u8)(val * 100 / 255);
-			dev_info(dev, "%s fan speed set: hwmon=%ld -> EC raw=%u (0-100)\n",
+			nitro_dbg(dev, "%s fan speed set: hwmon=%ld -> EC raw=%u (0-100)\n",
 				 channel == 0 ? "CPU" : "GPU", val, ec_val);
 			return nitro_ec_write(channel == 0
 					      ? regs->cpu_fan_speed_ctrl
