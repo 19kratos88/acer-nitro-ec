@@ -2,11 +2,29 @@
 
 ## System and installation
 - Hardware: Acer Nitro AN515-57; OS: CachyOS.
-- Current kernel: `7.2.4-1-cachyos`; LTS: `6.18.50-1-cachyos-lts`.
+- Current running kernel: `7.2.5-1-cachyos`; installed LTS kernel:
+  `6.18.50-1-cachyos-lts`.
 - Secure Boot is enabled. DKMS modules are signed with the sbctl Database Key.
 - `acer-nitro-ec` version `1.0.0` is installed through DKMS for both kernels.
 - Installation, signing, package verification, and hardware test results below
   are user-reported session context; do not assume future system state is unchanged.
+
+## Local Acer battery health setup
+- This is user-reported local system configuration, not part of the
+  `acer-nitro-ec` repository source files.
+- `acer-wmi-battery/0.2.0` is installed via DKMS for `7.2.5-1-cachyos` and
+  `6.18.50-1-cachyos-lts`; module `acer_wmi_battery` is loaded.
+- Battery health mode sysfs path:
+  `/sys/bus/wmi/drivers/acer-wmi-battery/health_mode`.
+  `health_mode=1` stops charging around 80%.
+- Observed after enabling the limit: `health_mode=1`, battery status
+  `Not charging`, and battery level 82%.
+- Persistent boot setup exists in
+  `/etc/systemd/system/acer-wmi-battery-health.service`: `Type=oneshot`,
+  writes `1` to `health_mode`, uses `RemainAfterExit=yes`, and is enabled
+  at `multi-user.target`.
+- Current reported validation: service enabled, `active (exited)`,
+  ExecStart `status=0/SUCCESS`, and `health_mode` remained `1`.
 
 ## EC discoveries and current encoding
 - AN515-57 requires bit `0x10` in EC register `0x03` for manual fan control.
@@ -57,8 +75,34 @@
   not leased; MANUAL must be explicitly reacquired after fallback.
 - Remove/shutdown retry AUTO restoration up to three times. Failed suspend
   restores recovery scheduling; successful resume unblocks control writes.
-- A local build on `7.2.4-1-cachyos` previously succeeded with no warnings/errors;
-  this is a historical check, not verification of subsequent source edits.
+
+## Latest safety fixes and build validation
+- Commit `5a30e4c` (Fail safely on unknown fan modes and cleanup errors) fixed
+  both previous release-blocking findings:
+  - CPU/GPU mode reads explicitly recognize TURBO=0, MANUAL=1, and AUTO=2.
+    Unknown firmware mode bytes fail the hwmon read with `-EIO`; they are
+    never silently treated as AUTO.
+  - `nitro-fan` cleanup forces exit status 1 if restoring AUTO fails, even
+    when the original status was 130 or 143. Successful cleanup preserves
+    the original status. Since the service accepts 130/143 but not 1,
+    cleanup failure cannot be reported as successful termination by systemd.
+- The safety-fixed driver built successfully with no warnings against both
+  `7.2.5-1-cachyos` and `6.18.50-1-cachyos-lts`, explicitly targeting their
+  available build trees:
+  `/lib/modules/7.2.5-1-cachyos/build` and
+  `/lib/modules/6.18.50-1-cachyos-lts/build`.
+- These are completed build checks, not guarantees after future source edits.
+
+## Latest DKMS, Secure Boot, and runtime module validation
+- User-reported completed installation: `acer-nitro-ec-dkms` `1.0.0-1` was
+  rebuilt/reinstalled; DKMS status showed `acer-nitro-ec/1.0.0` installed for
+  both `7.2.5-1-cachyos` and `6.18.50-1-cachyos-lts`.
+- Current 7.2.5 installed module path:
+  `/lib/modules/7.2.5-1-cachyos/updates/dkms/acer-nitro-ec.ko.zst`;
+  signer: `Database Key`.
+- After DKMS reinstall, the previously loaded module was still the old build.
+  It was safely reloaded; the loaded module then reported srcversion
+  `93157E421BCC9E0D57660DD`, and both fans were confirmed in AUTO.
 
 ## Userspace controller and desktop integration
 - Current project files: `nitro-fan`,
@@ -125,6 +169,27 @@
   both fans remained AUTO. Resume rechecked the EC fan-control feature bit
   (`0x03` bit `0x10`). Previous MANUAL mode/PWM was intentionally not restored.
 
+## Latest hardware validation on 7.2.5-1-cachyos
+- The following completed runtime results are user-reported. No invalid EC
+  mode bytes were written; normal valid reads exercised the updated mode
+  reporting without errors. Unknown-mode error paths were tested statically.
+- Dynamic hwmon discovery resolved to `hwmon5` during this test only. This is
+  not a permanent device number; always rediscover by `name=acer_nitro_ec`.
+- PWM 178 was requested and read back approximately 175 because of integer
+  hwmon 0–255 <-> EC raw 0–100 scaling. Both fans were confirmed in MANUAL
+  (`pwm1_enable=pwm2_enable=1`), at approximately CPU 4054 / GPU 4761 RPM.
+- After PWM renewal stopped, the five-second kernel lease returned BOTH fans
+  to AUTO (`pwm1_enable=pwm2_enable=2`). After an additional seven-second wait,
+  both remained AUTO.
+- `/usr/local/bin/nitro-fan` was updated to match the repository version.
+  `nitro-fan-gaming.service` started successfully and both fans entered MANUAL.
+  `systemctl stop` returned both fans to AUTO; the service ended inactive
+  (dead), and systemd reported "Deactivated successfully".
+- This validated successful userspace/service cleanup. Cleanup failure exit
+  statuses were checked with mocked tests, not induced hardware failures.
+- No MAX mode or CPU/GPU stress testing was used in this latest validation.
+  Earlier MAX and suspend/resume results above are separate historical tests.
+
 ## Safety rules for future work
 - Do not use `ec_sys` concurrently with `acer_nitro_ec`.
 - Discover hwmon by `name=acer_nitro_ec`; never hardcode a `hwmonX` number.
@@ -136,7 +201,26 @@
 - Do not run suspend tests until explicitly requested.
 - Inspect diffs before installing kernel module changes.
 
+## Git checkpoint and release state
+- Before this documentation update, the working tree was clean; local `main`
+  and cached `origin/main` pointed to `5a30e4c`. No remote fetch was performed.
+- Latest relevant commits, verified from local history:
+  - `5a30e4c` — Fail safely on unknown fan modes and cleanup errors.
+  - `17007c6` — Document fan control setup and integration.
+  - `5104500` — Add keyd and PolicyKit setup templates.
+  - `d69b5f7` — Add safe fan control and desktop integration.
+- The two previous release-blocking safety findings are fixed, committed,
+  built, installed, and runtime-validated on `7.2.5-1-cachyos` as described
+  above; failure-path tests remain static/mocked rather than hardware-induced.
+- The current setup has not been tagged for release. A pre-existing `v1.0.0`
+  tag already points to older commit `47026ba` (Fix dkms.conf: remove deprecated
+  REMAKE_INITRD), not the current safety-fixed checkpoint. Do not confuse this
+  older tag with a release of the completed setup.
+
 ## Next planned work
-1. Further validate the implemented locking and MANUAL lease failsafe when
-   explicitly authorized. Auto/gaming/max profiles and desktop integration
-   already exist as documented above.
+- Address remaining non-blocking audit hardening items in the next session:
+  routine PWM `dev_info` logging; `nitro-fan-toggle` activity-query error
+  handling; possible concurrent toggle serialization; optional service-readiness
+  improvement; and minor documentation/comment cleanup.
+- Then perform the final release audit and decide the release/tag strategy,
+  accounting for the existing older `v1.0.0` tag. Do not tag automatically.
