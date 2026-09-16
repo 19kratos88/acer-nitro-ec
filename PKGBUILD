@@ -7,11 +7,12 @@ arch=('any')
 url="https://github.com/OrnelasD-Rogers/acer-nitro-ec"
 license=('GPL-2.0-only')
 depends=('dkms')
-source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('12b3d15144f6e1282c6accb0bb40788dd6f05b1e854fbbd4afc5cfd9dea09e36')
+# Use the canonical files beside this PKGBUILD for local package builds.
+source=('acer-nitro-ec.c' 'Makefile' 'dkms.conf')
+sha256sums=('SKIP' 'SKIP' 'SKIP')
 
 package() {
-	cd "$srcdir/acer-nitro-ec-$pkgver"
+	cd "$srcdir"
 
 	local dest="$pkgdir/usr/src/acer-nitro-ec-$pkgver"
 	install -dm755 "$dest"

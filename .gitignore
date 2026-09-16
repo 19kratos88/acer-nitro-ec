@@ -1,0 +1,21 @@
+# Packaging work directories and archives
+src/
+pkg/
+*.pkg.tar.zst
+*.tar.zst
+acer-nitro-ec-*.tar.gz
+
+# Kernel module build outputs
+*.o
+*.ko
+*.ko.zst
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+.*.cmd
+Module.symvers
+modules.order
+
+# Local backups
+*.bak

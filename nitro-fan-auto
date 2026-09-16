@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() {
+    printf 'nitro-fan: %s\n' "$*" >&2
+    if command -v kdialog >/dev/null 2>&1; then
+        kdialog --error "$*" || true
+    fi
+    exit 1
+}
+
+# Wait for systemd's stop job; do not launch another fan controller.
+/usr/bin/systemctl --system stop nitro-fan-gaming.service || \
+    fail 'Could not stop the gaming service. AUTO has not been verified.'
+
+hwmon=
+for name_file in /sys/class/hwmon/*/name; do
+    [[ -r "$name_file" ]] || continue
+    if IFS= read -r name < "$name_file" && [[ "$name" == acer_nitro_ec ]]; then
+        [[ -z "$hwmon" ]] || fail 'Multiple acer_nitro_ec devices found; cannot verify AUTO unambiguously.'
+        hwmon=${name_file%/name}
+    fi
+done
+[[ -n "$hwmon" ]] || fail 'acer_nitro_ec hwmon device not found; AUTO could not be verified.'
+
+# Allow up to six seconds for kernel lease fallback if process cleanup failed.
+for ((attempt = 0; attempt <= 6; attempt++)); do
+    IFS= read -r cpu_mode < "$hwmon/pwm1_enable" || fail 'Cannot read CPU fan mode; AUTO could not be verified.'
+    IFS= read -r gpu_mode < "$hwmon/pwm2_enable" || fail 'Cannot read GPU fan mode; AUTO could not be verified.'
+    if [[ "$cpu_mode" == 2 && "$gpu_mode" == 2 ]]; then
+        printf 'nitro-fan: Both fans verified in firmware AUTO.\n'
+        if command -v notify-send >/dev/null 2>&1; then
+            notify-send 'Nitro fans' 'Both fans verified in firmware AUTO.' || true
+        fi
+        exit 0
+    fi
+    if (( attempt < 6 )); then
+        sleep 1
+    fi
+done
+fail "AUTO not confirmed: CPU mode=$cpu_mode, GPU mode=$gpu_mode. Check for another controller or EC errors."

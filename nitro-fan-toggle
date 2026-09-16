@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if /usr/bin/systemctl --system is-active --quiet nitro-fan-gaming.service; then
+    exec /usr/local/bin/nitro-fan-auto
+else
+    exec /usr/local/bin/nitro-fan-gaming-start
+fi

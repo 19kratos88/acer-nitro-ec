@@ -21,6 +21,10 @@
  *   temp2_input     - GPU temperature (millidegrees Celsius)
  *   temp3_input     - System temperature (millidegrees Celsius)
  *
+ * MANUAL mode has a five-second lease per fan. Successful PWM writes
+ * refresh only that fan; expiry of either lease restores both fans to AUTO.
+ * TURBO is not leased. Re-enter MANUAL explicitly after fallback.
+ *
  * Logging:
  *   - Load with debug=1 for verbose output:
  *       sudo insmod acer-nitro-ec.ko debug=1
@@ -32,14 +36,21 @@
 
 #define DRIVER_NAME "acer-nitro-ec"
 #define pr_fmt(fmt) DRIVER_NAME ": " fmt
+#define NITRO_FEATURE_CTRL_REG 0x03
+#define NITRO_FAN_CONTROL_ENABLE 0x10
 
 #include <linux/acpi.h>
+#include <linux/delay.h>
 #include <linux/dmi.h>
 #include <linux/hwmon.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/jiffies.h>
+#include <linux/mutex.h>
+#include <linux/workqueue.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 
 /* When debug=1, emit dev_dbg messages as dev_info so they appear in dmesg
  * without needing to change the kernel log level or dynamic_debug config.
@@ -74,6 +85,9 @@ struct nitro_ec_regs {
 	u8 gpu_temp;
 	u8 sys_temp;
 };
+
+/* MANUAL must be refreshed by successful PWM writes within five seconds. */
+#define NITRO_MANUAL_LEASE_MS 5000
 
 /* Fan mode EC values */
 #define CPU_AUTO_MODE		0x04
@@ -122,8 +136,19 @@ static const struct nitro_ec_regs regs_an515_44 = {
 /* Per-device data                                                      */
 /* ------------------------------------------------------------------ */
 
+struct nitro_manual_lease {
+	bool active;
+	unsigned long deadline;
+};
+
 struct nitro_ec_data {
 	struct device		  *hwmon_dev;
+	struct device		  *dev;
+	struct mutex lock;
+	struct delayed_work lease_work;
+	struct nitro_manual_lease leases[2];
+	bool writes_blocked;
+	bool auto_pending;
 	const struct nitro_ec_regs *regs;
 };
 
@@ -150,6 +175,135 @@ static int nitro_ec_write(u8 addr, u8 val)
 			addr, val, ret);
 
 	return ret;
+}
+
+static int nitro_enable_fan_control(struct device *dev)
+{
+	const char *model = dmi_get_system_info(DMI_PRODUCT_NAME);
+	u8 feature_flags, new_flags;
+	int ret;
+
+	if (!model ||
+	    (!strstr(model, "AN515-57") && !strstr(model, "AN515-58")))
+		return 0;
+
+	/* Fresh read-modify-write preserves unrelated feature flags. */
+	ret = nitro_ec_read(NITRO_FEATURE_CTRL_REG, &feature_flags);
+	if (ret) {
+		dev_err(dev, "failed to read EC feature control register: %d\n",
+			ret);
+		return ret;
+	}
+
+	if (feature_flags & NITRO_FAN_CONTROL_ENABLE) {
+		dev_info(dev, "EC fan control already enabled: 0x%02x\n",
+			 feature_flags);
+		return 0;
+	}
+
+	new_flags = feature_flags | NITRO_FAN_CONTROL_ENABLE;
+	ret = nitro_ec_write(NITRO_FEATURE_CTRL_REG, new_flags);
+	if (ret) {
+		dev_err(dev, "failed to enable EC fan control: %d\n", ret);
+		return ret;
+	}
+
+	dev_info(dev, "EC fan control enabled: 0x%02x -> 0x%02x\n",
+		 feature_flags, new_flags);
+	return 0;
+}
+
+static int nitro_set_fans_auto(struct device *dev)
+{
+	struct nitro_ec_data *data = dev_get_drvdata(dev);
+	int cpu_ret, gpu_ret;
+
+	cpu_ret = nitro_ec_write(data->regs->cpu_fan_mode_ctrl,
+				CPU_AUTO_MODE);
+	if (cpu_ret)
+		dev_err(dev, "failed to restore CPU fan AUTO mode: %d\n",
+			cpu_ret);
+
+	/* Always attempt both fans, even if the CPU write failed. */
+	gpu_ret = nitro_ec_write(data->regs->gpu_fan_mode_ctrl,
+				GPU_AUTO_MODE);
+	if (gpu_ret)
+		dev_err(dev, "failed to restore GPU fan AUTO mode: %d\n",
+			gpu_ret);
+
+	return cpu_ret ? cpu_ret : gpu_ret;
+}
+
+/* All lease helpers and AUTO writes are called with data->lock held. */
+static void nitro_invalidate_leases(struct nitro_ec_data *data)
+{
+	data->leases[0].active = false;
+	data->leases[1].active = false;
+}
+
+static void nitro_schedule_lease_work(struct nitro_ec_data *data)
+{
+	unsigned long now = jiffies, deadline = 0;
+	bool active = false;
+	int i;
+
+	if (data->writes_blocked)
+		return;
+	if (data->auto_pending) {
+		mod_delayed_work(system_wq, &data->lease_work,
+				 msecs_to_jiffies(NITRO_MANUAL_LEASE_MS));
+		return;
+	}
+	for (i = 0; i < ARRAY_SIZE(data->leases); i++) {
+		if (!data->leases[i].active)
+			continue;
+		if (!active || time_before(data->leases[i].deadline, deadline))
+			deadline = data->leases[i].deadline;
+		active = true;
+	}
+	if (active)
+		mod_delayed_work(system_wq, &data->lease_work,
+				 time_after(deadline, now) ? deadline - now : 0);
+	else
+		cancel_delayed_work(&data->lease_work);
+}
+
+static int nitro_check_lease_expiry(struct nitro_ec_data *data)
+{
+	unsigned long now = jiffies;
+	int i, ret;
+
+	for (i = 0; i < ARRAY_SIZE(data->leases); i++) {
+		if (data->leases[i].active &&
+		    time_after_eq(now, data->leases[i].deadline)) {
+			dev_warn(data->dev,
+				 "%s MANUAL lease expired; restoring both fans to AUTO\n",
+				 i == 0 ? "CPU" : "GPU");
+			nitro_invalidate_leases(data);
+			data->auto_pending = true;
+			break;
+		}
+	}
+	if (!data->auto_pending)
+		return 0;
+
+	ret = nitro_set_fans_auto(data->dev);
+	data->auto_pending = !!ret;
+	/* Failed restoration blocks writes and is retried by the same worker. */
+	return ret;
+}
+
+static void nitro_lease_work(struct work_struct *work)
+{
+	struct nitro_ec_data *data = container_of(to_delayed_work(work),
+						 struct nitro_ec_data, lease_work);
+
+	mutex_lock(&data->lock);
+	if (!data->writes_blocked) {
+		nitro_check_lease_expiry(data);
+		nitro_schedule_lease_work(data);
+	}
+	mutex_unlock(&data->lock);
 }
 
 /*
@@ -237,9 +391,9 @@ static int nitro_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 					    : regs->gpu_fan_speed_ctrl, &raw);
 			if (ret)
 				return ret;
-			/* EC uses 0-100%; hwmon expects 0-255 */
+			/* EC uses raw values 0-100; hwmon expects 0-255 */
 			*val = (long)raw * 255 / 100;
-			nitro_dbg(dev, "%s pwm read: EC=%u%% hwmon=%ld\n",
+			nitro_dbg(dev, "%s pwm read: EC raw=%u (0-100) hwmon=%ld\n",
 				  channel == 0 ? "CPU" : "GPU", raw, *val);
 			return 0;
 
@@ -296,7 +450,7 @@ static int nitro_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 	return -EOPNOTSUPP;
 }
 
-static int nitro_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
+static int nitro_hwmon_write_locked(struct device *dev, enum hwmon_sensor_types type,
 			     u32 attr, int channel, long val)
 {
 	struct nitro_ec_data *data = dev_get_drvdata(dev);
@@ -311,9 +465,9 @@ static int nitro_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
 		case hwmon_pwm_input:
 			if (val < 0 || val > 255)
 				return -EINVAL;
-			/* Scale 0-255 → 0-100 */
+			/* Scale hwmon 0-255 to raw EC 0-100 */
 			ec_val = (u8)(val * 100 / 255);
-			dev_info(dev, "%s fan speed set: hwmon=%ld -> EC=%u%%\n",
+			dev_info(dev, "%s fan speed set: hwmon=%ld -> EC raw=%u (0-100)\n",
 				 channel == 0 ? "CPU" : "GPU", val, ec_val);
 			return nitro_ec_write(channel == 0
 					      ? regs->cpu_fan_speed_ctrl
@@ -367,6 +521,47 @@ static int nitro_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
 	return -EOPNOTSUPP;
 }
 
+static int nitro_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
+			     u32 attr, int channel, long val)
+{
+	struct nitro_ec_data *data = dev_get_drvdata(dev);
+	int ret;
+
+	if (type != hwmon_pwm || channel < 0 ||
+	    channel >= ARRAY_SIZE(data->leases) ||
+	    (attr != hwmon_pwm_input && attr != hwmon_pwm_enable))
+		return -EOPNOTSUPP;
+
+	mutex_lock(&data->lock);
+	if (data->writes_blocked) {
+		ret = -EBUSY;
+		goto out;
+	}
+	/* Check before even invalid writes, and before any possible renewal. */
+	ret = nitro_check_lease_expiry(data);
+	if (ret)
+		goto schedule;
+
+	ret = nitro_hwmon_write_locked(dev, type, attr, channel, val);
+	if (!ret) {
+		if (attr == hwmon_pwm_enable) {
+			data->leases[channel].active = val == 1;
+			if (val == 1)
+				nitro_dbg(dev, "%s MANUAL lease started (%u ms)\n",
+					  channel == 0 ? "CPU" : "GPU",
+					  NITRO_MANUAL_LEASE_MS);
+		}
+		if (data->leases[channel].active)
+			data->leases[channel].deadline = jiffies +
+				msecs_to_jiffies(NITRO_MANUAL_LEASE_MS);
+	}
+schedule:
+	nitro_schedule_lease_work(data);
+out:
+	mutex_unlock(&data->lock);
+	return ret;
+}
+
 /* ------------------------------------------------------------------ */
 /* hwmon chip descriptor                                                */
 /* ------------------------------------------------------------------ */
@@ -404,12 +599,17 @@ static int nitro_ec_probe(struct platform_device *pdev)
 {
 	const struct nitro_ec_regs *regs;
 	struct nitro_ec_data *data;
+	int ret;
 
 	regs = dev_get_platdata(&pdev->dev);
 	if (!regs) {
 		dev_err(&pdev->dev, "no platform data — aborting probe\n");
 		return -ENODEV;
 	}
+
+	ret = nitro_enable_fan_control(&pdev->dev);
+	if (ret)
+		return ret;
 
 	dev_dbg(&pdev->dev, "EC register map:\n"
 		"  CPU fan mode=0x%02X speed=0x%02X rpm=0x%02X/0x%02X\n"
@@ -426,7 +626,18 @@ static int nitro_ec_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	data->regs = regs;
+	data->dev = &pdev->dev;
+	data->writes_blocked = true;
+	mutex_init(&data->lock);
+	INIT_DELAYED_WORK(&data->lease_work, nitro_lease_work);
 	platform_set_drvdata(pdev, data);
+
+	/* Establish the safe state before exposing writable hwmon attributes. */
+	mutex_lock(&data->lock);
+	ret = nitro_set_fans_auto(&pdev->dev);
+	mutex_unlock(&data->lock);
+	if (ret)
+		return ret;
 
 	data->hwmon_dev = devm_hwmon_device_register_with_info(
 		&pdev->dev, "acer_nitro_ec", data,
@@ -438,6 +649,10 @@ static int nitro_ec_probe(struct platform_device *pdev)
 		return PTR_ERR(data->hwmon_dev);
 	}
 
+	mutex_lock(&data->lock);
+	data->writes_blocked = false;
+	mutex_unlock(&data->lock);
+
 	dev_info(&pdev->dev, "hwmon interface registered at %s\n",
 		 dev_name(data->hwmon_dev));
 	if (debug)
@@ -446,10 +661,87 @@ static int nitro_ec_probe(struct platform_device *pdev)
 	return 0;
 }
 
+static int nitro_stop_fan_control(struct device *dev, bool teardown)
+{
+	struct nitro_ec_data *data = dev_get_drvdata(dev);
+	int attempt, ret;
+	int attempts = teardown ? 3 : 1;
+
+	mutex_lock(&data->lock);
+	data->writes_blocked = true;
+	nitro_invalidate_leases(data);
+	mutex_unlock(&data->lock);
+
+	/* The worker needs lock: drain it only after releasing lock. */
+	cancel_delayed_work_sync(&data->lease_work);
+
+	mutex_lock(&data->lock);
+	for (attempt = 0; attempt < attempts; attempt++) {
+		ret = nitro_set_fans_auto(dev);
+		if (!ret)
+			break;
+		if (attempt + 1 < attempts)
+			msleep(100);
+	}
+	if (ret && teardown)
+		dev_err(dev, "failed to restore both fans to AUTO after %d teardown attempts: %d\n",
+			attempts, ret);
+	data->auto_pending = !!ret;
+	mutex_unlock(&data->lock);
+	return ret;
+}
+
+static void nitro_ec_remove(struct platform_device *pdev)
+{
+	nitro_stop_fan_control(&pdev->dev, true);
+}
+
+static void nitro_ec_shutdown(struct platform_device *pdev)
+{
+	nitro_stop_fan_control(&pdev->dev, true);
+}
+
+static int nitro_ec_suspend(struct device *dev)
+{
+	struct nitro_ec_data *data = dev_get_drvdata(dev);
+	int ret = nitro_stop_fan_control(dev, false);
+
+	if (ret) {
+		/* Suspend was rejected; keep recovery running on the awake device. */
+		mutex_lock(&data->lock);
+		data->writes_blocked = false;
+		nitro_schedule_lease_work(data);
+		mutex_unlock(&data->lock);
+	}
+	return ret;
+}
+
+static int nitro_ec_resume(struct device *dev)
+{
+	struct nitro_ec_data *data = dev_get_drvdata(dev);
+	int ret;
+
+	mutex_lock(&data->lock);
+	/* Recheck the feature quirk without restoring old leases or PWM modes. */
+	ret = nitro_enable_fan_control(dev);
+	if (!ret) {
+		data->writes_blocked = false;
+		nitro_schedule_lease_work(data);
+	}
+	mutex_unlock(&data->lock);
+	return ret;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(nitro_ec_pm_ops,
+			       nitro_ec_suspend, nitro_ec_resume);
+
 static struct platform_driver nitro_ec_driver = {
 	.probe  = nitro_ec_probe,
+	.remove = nitro_ec_remove,
+	.shutdown = nitro_ec_shutdown,
 	.driver = {
 		.name = DRIVER_NAME,
+		.pm = pm_sleep_ptr(&nitro_ec_pm_ops),
 	},
 };
 

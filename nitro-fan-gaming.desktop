@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Nitro Fans: Gaming
+Comment=Start the dynamic gaming fan curve
+Exec=/usr/local/bin/nitro-fan-gaming-start
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;

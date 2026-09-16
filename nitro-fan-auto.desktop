@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Nitro Fans: Auto
+Comment=Stop gaming fan control and verify firmware AUTO
+Exec=/usr/local/bin/nitro-fan-auto
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;

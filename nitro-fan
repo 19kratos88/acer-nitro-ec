@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Foreground fan profiles. SIGKILL cannot run cleanup; the kernel's
+# five-second MANUAL lease is the final failsafe when PWM updates stop.
+# All control commands share this lock; status never acquires it.
+readonly LOCK_FILE=/run/nitro-fan.lock
+hwmon=
+
+die() {
+    printf 'nitro-fan: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    printf 'Usage: %s {auto|gaming|max|status}\n' "${0##*/}" >&2
+    printf 'gaming: dynamic 70-90%% temperature curve; max: explicit PWM 255.\n' >&2
+}
+
+discover_hwmon() {
+    local name_file name
+    local -a matches=()
+    for name_file in /sys/class/hwmon/*/name; do
+        [[ -r "$name_file" ]] || continue
+        if IFS= read -r name < "$name_file" && [[ "$name" == acer_nitro_ec ]]; then
+            matches+=("${name_file%/name}")
+        fi
+    done
+    (( ${#matches[@]} > 0 )) || die 'acer_nitro_ec hwmon device not found.'
+    (( ${#matches[@]} == 1 )) || die 'Multiple acer_nitro_ec devices found; refusing an ambiguous selection.'
+    hwmon=${matches[0]}
+}
+
+read_attr() {
+    local value
+    if ! IFS= read -r value < "$hwmon/$1"; then
+        die "Cannot read $hwmon/$1."
+    fi
+    printf '%s\n' "$value"
+}
+
+mode_name() {
+    case "$1" in
+        0) printf 'TURBO' ;;
+        1) printf 'MANUAL' ;;
+        2) printf 'AUTO' ;;
+        *) printf 'UNKNOWN(%s)' "$1" ;;
+    esac
+}
+
+celsius() {
+    local value=$1
+    [[ "$value" =~ ^-?[0-9]+$ ]] || die "Invalid temperature: $value."
+    awk -v millidegrees="$value" 'BEGIN { printf "%.3f", millidegrees / 1000 }'
+}
+
+show_status() {
+    local cpu_mode gpu_mode cpu_pwm gpu_pwm cpu_rpm gpu_rpm
+    local cpu_temp gpu_temp system_temp
+    cpu_mode=$(read_attr pwm1_enable)
+    gpu_mode=$(read_attr pwm2_enable)
+    cpu_pwm=$(read_attr pwm1)
+    gpu_pwm=$(read_attr pwm2)
+    cpu_rpm=$(read_attr fan1_input)
+    gpu_rpm=$(read_attr fan2_input)
+    cpu_temp=$(read_attr temp1_input)
+    gpu_temp=$(read_attr temp2_input)
+    system_temp=$(read_attr temp3_input)
+    cpu_temp=$(celsius "$cpu_temp")
+    gpu_temp=$(celsius "$gpu_temp")
+    system_temp=$(celsius "$system_temp")
+    printf 'hwmon: %s\n' "$hwmon"
+    printf 'CPU: mode=%s PWM=%s RPM=%s temperature=%s °C\n' \
+        "$(mode_name "$cpu_mode")" "$cpu_pwm" "$cpu_rpm" "$cpu_temp"
+    printf 'GPU: mode=%s PWM=%s RPM=%s temperature=%s °C\n' \
+        "$(mode_name "$gpu_mode")" "$gpu_pwm" "$gpu_rpm" "$gpu_temp"
+    printf 'System temperature: %s °C\n' "$system_temp"
+}
+
+check_permissions() {
+    local attr
+    for attr in "$@"; do
+        [[ -w "$hwmon/$attr" ]] || die "Insufficient permission to write $hwmon/$attr."
+    done
+}
+
+lock_control() {
+    command -v flock >/dev/null 2>&1 || die 'flock is required for control commands.'
+    if ! exec {lock_fd}>"$LOCK_FILE"; then
+        die "Cannot open $LOCK_FILE; control commands need permission to create/open the lock under /run."
+    fi
+    flock -n "$lock_fd" || die 'Another nitro-fan control command is active; stop it before changing modes.'
+    # Do not unlink the lock file: that could allow locks on different inodes.
+}
+
+restore_auto() {
+    local failed=0 attr
+    for attr in pwm1_enable pwm2_enable; do
+        if ! printf '2\n' > "$hwmon/$attr"; then
+            printf 'nitro-fan: Failed to restore AUTO through %s/%s.\n' "$hwmon" "$attr" >&2
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
+cleanup() {
+    local result=$?
+    trap - EXIT
+    # Keep cleanup from being interrupted by another INT/TERM.
+    trap '' INT TERM
+    if ! restore_auto; then
+        (( result != 0 )) || result=1
+    fi
+    exit "$result"
+}
+
+write_attr() {
+    if ! printf '%s\n' "$2" > "$hwmon/$1"; then
+        die "Failed to write $hwmon/$1; attempting both fans AUTO."
+    fi
+}
+
+refresh_pwm() {
+    write_attr pwm1 "$1"
+    write_attr pwm2 "$1"
+}
+
+gaming_temperature() {
+    local cpu_temp gpu_temp control_temp value
+    cpu_temp=$(read_attr temp1_input)
+    gpu_temp=$(read_attr temp2_input)
+    for value in "$cpu_temp" "$gpu_temp"; do
+        # The driver reports unsigned byte temperatures in millidegrees.
+        [[ "$value" =~ ^[0-9]{1,6}$ ]] || die "Invalid gaming temperature: $value."
+        (( 10#$value <= 255000 )) || die "Out-of-range gaming temperature: $value."
+    done
+    cpu_temp=$((10#$cpu_temp))
+    gpu_temp=$((10#$gpu_temp))
+    control_temp=$cpu_temp
+    if (( gpu_temp > control_temp )); then
+        control_temp=$gpu_temp
+    fi
+    printf '%s\n' "$control_temp"
+}
+
+gaming_pwm() {
+    local control_temp=$1 current=${2:-} step=0 candidate=0
+    local -a thresholds=(55000 65000 75000 85000)
+    local -a targets=(178 191 204 217 230)
+    while (( candidate < 4 && control_temp >= thresholds[candidate] )); do
+        candidate=$((candidate + 1))
+    done
+    if [[ -z "$current" ]]; then
+        step=$candidate
+    else
+        case "$current" in
+            178) step=0 ;;
+            191) step=1 ;;
+            204) step=2 ;;
+            217) step=3 ;;
+            230) step=4 ;;
+            *) die "Invalid gaming step: $current." ;;
+        esac
+        if (( candidate > step )); then
+            step=$candidate
+        else
+            # Downward crossings require 3 C below each normal threshold.
+            while (( step > 0 && control_temp < thresholds[step - 1] - 3000 )); do
+                step=$((step - 1))
+            done
+        fi
+    fi
+    printf '%s\n' "${targets[step]}"
+}
+
+run_gaming() {
+    local target next_target control_temp cpu_mode gpu_mode
+    restore_auto || die 'Initial AUTO restoration failed.'
+    control_temp=$(gaming_temperature)
+    target=$(gaming_pwm "$control_temp")
+    # Set the initial curve target in AUTO before entering MANUAL.
+    refresh_pwm "$target"
+    write_attr pwm1_enable 1
+    write_attr pwm2_enable 1
+    refresh_pwm "$target"
+    printf 'nitro-fan: gaming active (dynamic 70-90%% curve); Ctrl+C restores AUTO.\n'
+    while true; do
+        sleep 1
+        control_temp=$(gaming_temperature)
+        next_target=$(gaming_pwm "$control_temp" "$target")
+        # Always rewrite both PWM values, even if the curve step is unchanged.
+        refresh_pwm "$next_target"
+        cpu_mode=$(read_attr pwm1_enable)
+        gpu_mode=$(read_attr pwm2_enable)
+        [[ "$cpu_mode" == 1 && "$gpu_mode" == 1 ]] || \
+            die 'MANUAL control was lost; restoring AUTO. Restart explicitly to reacquire control.'
+        if [[ "$next_target" != "$target" ]]; then
+            printf 'gaming: %s C -> PWM %s\n' "$((control_temp / 1000))" "$next_target"
+        fi
+        target=$next_target
+    done
+}
+
+run_profile() {
+    local target=$1 cpu_mode gpu_mode
+    # Establish AUTO even if a previous program left MANUAL or TURBO active.
+    restore_auto || die 'Initial AUTO restoration failed.'
+    refresh_pwm "$target"
+    write_attr pwm1_enable 1
+    write_attr pwm2_enable 1
+    refresh_pwm "$target"
+    printf 'nitro-fan: %s active (PWM %s); Ctrl+C restores AUTO.\n' "$command" "$target"
+    while true; do
+        sleep 1
+        cpu_mode=$(read_attr pwm1_enable)
+        gpu_mode=$(read_attr pwm2_enable)
+        # Never silently reacquire MANUAL after lease expiry or external changes.
+        [[ "$cpu_mode" == 1 && "$gpu_mode" == 1 ]] || \
+            die 'MANUAL control was lost; restoring AUTO. Restart explicitly to reacquire control.'
+        refresh_pwm "$target"
+    done
+}
+
+if (( $# != 1 )); then
+    usage
+    exit 2
+fi
+command=$1
+case "$command" in
+    auto|gaming|max|status) ;;
+    *) usage; exit 2 ;;
+esac
+
+discover_hwmon
+if [[ "$command" == status ]]; then
+    show_status
+    exit 0
+fi
+
+check_permissions pwm1_enable pwm2_enable
+if [[ "$command" != auto ]]; then
+    check_permissions pwm1 pwm2
+    [[ -r "$hwmon/pwm1_enable" && -r "$hwmon/pwm2_enable" ]] || \
+        die 'Control profiles require readable fan mode attributes.'
+fi
+lock_control
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+case "$command" in
+    auto) exit 0 ;; # EXIT cleanup performs both AUTO writes, reporting failures.
+    gaming) run_gaming ;;
+    max) run_profile 255 ;;
+esac

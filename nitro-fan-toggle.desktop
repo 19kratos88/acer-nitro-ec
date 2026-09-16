@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Nitro Fans: Toggle
+Comment=Toggle between firmware AUTO and dynamic gaming fan control
+Exec=/usr/local/bin/nitro-fan-toggle
+Terminal=false
+Categories=System;

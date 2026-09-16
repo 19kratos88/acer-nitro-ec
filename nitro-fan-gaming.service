@@ -1,0 +1,18 @@
+[Unit]
+Description=Acer Nitro dynamic gaming fan controller
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/nitro-fan gaming
+Restart=no
+KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=no
+TimeoutStartSec=10s
+TimeoutStopSec=10s
+SuccessExitStatus=130 143
+StandardOutput=journal
+StandardError=journal
+
+# Deliberately no [Install] section: start on demand, never enable at boot.
