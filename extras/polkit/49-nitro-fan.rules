@@ -1,0 +1,15 @@
+// Grant only start/stop of nitro-fan-gaming.service.
+// This does not grant generic passwordless sudo/root access.
+// The username is installation-specific; adjust it for another user.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        subject.user == "branislavb" &&
+        action.lookup("unit") == "nitro-fan-gaming.service") {
+
+        var verb = action.lookup("verb");
+
+        if (verb == "start" || verb == "stop") {
+            return polkit.Result.YES;
+        }
+    }
+});

@@ -96,6 +96,12 @@
   `AT Translated Set 2 keyboard`, id `0001:0001:093d12dc`.
   keyd remaps `f16` -> `f24`; KDE binds F24 to
   `/usr/local/bin/nitro-fan-toggle`.
+- Reproducible configuration templates: `extras/keyd/nitro.conf` targets the
+  built-in keyboard and maps F16 to F24; `extras/polkit/49-nitro-fan.rules`
+  grants only service start/stop to `branislavb`, without generic passwordless
+  sudo/root access. Adjust the rule's installation-specific username for another
+  user. These project templates are not automatically installed; the KDE F24
+  binding remains a separate desktop setting.
 - Desktop launchers (Gaming, Auto, Toggle) and terminal commands remain fallback
   controls. Terminal helpers: `/usr/local/bin/nitro-fan-gaming-start`,
   `/usr/local/bin/nitro-fan-auto`, and `/usr/local/bin/nitro-fan-toggle`;
