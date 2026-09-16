@@ -42,6 +42,8 @@
   Probe/lifecycle, mode-change, warning, and error logging remain unchanged.
 - PWM scaling intentionally maps hwmon `0–255` to EC raw `0–100`.
   Read: `raw * 255 / 100`; write: `val * 100 / 255` (integer arithmetic).
+  The nominal read range assumes raw <=100; reads are not clamped, so firmware
+  raw values above 100 produce hwmon values above 255.
 - Mode values are shared across current model maps. Lifecycle code must use
   the selected register map and existing constants, not hardcoded addresses.
 
@@ -72,9 +74,11 @@
   `writes_blocked` gates writes during suspend and teardown; lifecycle callbacks
   invalidate leases and drain delayed work before restoring AUTO.
 - MANUAL has a five-second lease per fan; successful PWM writes renew that
-  fan's lease. Expiry of either lease attempts AUTO for both fans. Failed AUTO
-  restoration blocks control writes and is retried by delayed work. TURBO is
-  not leased; MANUAL must be explicitly reacquired after fallback.
+  fan's lease. Successful MANUAL mode writes also start/reset that fan's lease,
+  including repeated mode 1 writes. Expiry of either lease attempts AUTO for
+  both fans. Failed AUTO restoration blocks control writes and is retried by
+  delayed work. TURBO is not leased; MANUAL must be explicitly reacquired after
+  fallback.
 - Remove/shutdown retry AUTO restoration up to three times. Failed suspend
   restores recovery scheduling; successful resume unblocks control writes.
 
@@ -102,7 +106,8 @@
 - Current 7.2.5 installed module path:
   `/lib/modules/7.2.5-1-cachyos/updates/dkms/acer-nitro-ec.ko.zst`;
   signer: `Database Key`.
-- After DKMS reinstall, the previously loaded module was still the old build.
+- During the earlier safety-fix validation, after DKMS reinstall the previously
+  loaded module was still the old build.
   It was safely reloaded; the loaded module then reported srcversion
   `93157E421BCC9E0D57660DD`, and both fans were confirmed in AUTO.
 
@@ -119,7 +124,9 @@
   >=85 C -> 230.
 - Downward hysteresis is 3 C: a lower step requires temperature strictly below
   the crossed threshold minus 3 C. Upward changes use the normal thresholds.
-- Gaming and max refresh PWM every second to renew the kernel MANUAL leases.
+- Gaming and max refresh PWM each iteration to renew the kernel MANUAL leases.
+  The interval is a one-second sleep plus processing/EC access time, not a strict
+  periodic deadline.
   Loss of MANUAL exits with AUTO cleanup; control must be restarted explicitly.
 - MAX is explicit PWM 255 and is never selected automatically by gaming.
 - `nitro-fan-gaming.service` runs `/usr/local/bin/nitro-fan gaming` as root
@@ -239,8 +246,10 @@
 
 ## Git checkpoint and release state
 - Before this documentation update, the working tree was clean; local `main`
-  and cached `origin/main` pointed to `5a30e4c`. No remote fetch was performed.
+  and cached `origin/main` pointed to `c01daaf`. No remote fetch was performed.
 - Latest relevant commits, verified from local history:
+  - `c01daaf` — Harden fan toggle and reduce PWM logging.
+  - `506418b` — Update project context and battery health setup.
   - `5a30e4c` — Fail safely on unknown fan modes and cleanup errors.
   - `17007c6` — Document fan control setup and integration.
   - `5104500` — Add keyd and PolicyKit setup templates.
@@ -257,7 +266,12 @@
 - Completed: routine PWM logging hardening, concurrency serialization, and
   750 ms debounce are implemented and runtime-validated. Toggle query-error
   handling is completed and covered by mocked tests.
-- Remaining non-blocking audit items: optional service-readiness improvement
-  and minor documentation/comment cleanup.
+- Service-readiness review completed: keep `Type=simple` and the start helper
+  unchanged. Start success does not prove MANUAL readiness; controller failures
+  are logged and existing cleanup/lease fallback remains in place. No dependent
+  unit in this repository requires a readiness handshake. Use `nitro-fan status`
+  for confirmation; extra synchronization is not warranted for this setup.
+- Minor comment/documentation cleanup completed: RPM byte order, MANUAL-write
+  lease renewal, unclamped PWM read assumptions, and loop timing are clarified.
 - Then perform the final release audit and decide the release/tag strategy,
   accounting for the existing older `v1.0.0` tag. Do not tag automatically.

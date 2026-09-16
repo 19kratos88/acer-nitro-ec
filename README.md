@@ -42,6 +42,9 @@ RPM is `(high << 8) | low`. PWM intentionally maps hwmon **0–255** to EC raw
 - Write: `raw = val * 100 / 255`.
 - Read: `val = raw * 255 / 100`.
 
+The nominal read range assumes firmware raw values are at most 100. Reads
+are not clamped: a firmware value above 100 produces hwmon PWM above 255.
+
 AN515-57 measurements were approximately CPU/GPU 3797/4477 RPM at raw 50,
 4109/4761 at raw 60, 4615/5454 at raw 80, and 4838/5769 at raw 90.
 Raw values at or above 100 produced approximately maximum fan speed.
@@ -54,7 +57,9 @@ Firmware **AUTO** is the default/recommended idle mode. hwmon mode values are
 `max` profile, which uses MANUAL with PWM 255.
 
 MANUAL has a **five-second lease per fan**. Successful PWM writes renew that
-fan's lease; expiry of either lease attempts to restore **both** fans to AUTO.
+fan's lease. Successful MANUAL mode writes also start/reset that fan's lease,
+including repeated writes of mode 1. Expiry of either lease attempts to restore
+**both** fans to AUTO.
 Failed AUTO restoration blocks control writes and is retried by delayed work.
 TURBO is not leased. MANUAL must be explicitly reacquired after fallback.
 A mutex serializes control writes, lease handling, and lifecycle transitions.
@@ -111,7 +116,7 @@ DKMS results for each intended kernel.
 
 With Secure Boot enabled, configure DKMS signing with a key trusted by the
 machine before loading the module. The recorded setup uses the sbctl Database
-Key, with version 1.0.0 installed for `7.2.4-1-cachyos` and
+Key, with version 1.0.0 installed for `7.2.5-1-cachyos` and
 `6.18.50-1-cachyos-lts`. Those are historical local versions, not prerequisites
 or a signing configuration supplied by this repository.
 
@@ -162,8 +167,10 @@ Ctrl+C before running `auto`. If gaming is running as a service, use
 will encounter its lock. The Auto helper does not stop an unrelated foreground
 controller.
 
-Gaming and max refresh both PWM values every second to renew the leases, even
-when the target is unchanged. Cleanup attempts both AUTO writes on exit,
+Gaming and max refresh both PWM values on each loop iteration to renew the
+leases, even when the target is unchanged. Each iteration sleeps one second
+plus time spent processing and accessing the EC; this is not a strict periodic
+deadline. Cleanup attempts both AUTO writes on exit,
 SIGINT, or SIGTERM. Loss of MANUAL causes an exit with AUTO cleanup; restart
 explicitly to regain control. MAX is an explicit manual choice and is never
 selected automatically.
@@ -191,6 +198,12 @@ steps can be crossed in one update. Gaming never selects PWM 255.
 on demand, with `Restart=no`. Stopping sends SIGTERM so shell cleanup restores
 AUTO; the unit disables a subsequent SIGKILL. The kernel lease remains the
 fallback if PWM refreshes stop.
+
+`Type=simple` start success means systemd launched the service, not that the
+controller has already entered MANUAL. The start helper does not verify readiness;
+startup failures are reported by the controller in the journal. Use `nitro-fan status`
+when confirmation is needed. There are no dependent units requiring a MANUAL-ready
+handshake in this repository, so no extra readiness synchronization is used.
 
 | Helper | Behavior |
 | --- | --- |

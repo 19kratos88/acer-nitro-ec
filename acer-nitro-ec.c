@@ -22,7 +22,8 @@
  *   temp3_input     - System temperature (millidegrees Celsius)
  *
  * MANUAL mode has a five-second lease per fan. Successful PWM writes
- * refresh only that fan; expiry of either lease restores both fans to AUTO.
+ * refresh only that fan; successful MANUAL mode writes also start/reset its
+ * lease. Expiry of either lease attempts to restore both fans to AUTO.
  * TURBO is not leased. Re-enter MANUAL explicitly after fallback.
  *
  * Logging:
@@ -86,7 +87,7 @@ struct nitro_ec_regs {
 	u8 sys_temp;
 };
 
-/* MANUAL must be refreshed by successful PWM writes within five seconds. */
+/* Per-fan deadline after MANUAL selection or a successful leased PWM write. */
 #define NITRO_MANUAL_LEASE_MS 5000
 
 /* Fan mode EC values */
@@ -308,7 +309,8 @@ static void nitro_lease_work(struct work_struct *work)
 
 /*
  * Read a 16-bit RPM value from two consecutive EC registers.
- * The EC stores the raw fan RPM as a big-endian 16-bit integer.
+ * The lower address holds the low byte; the next address holds the high byte.
+ * The register-map hi/lo field names follow the reversed legacy EC labels.
  */
 static int nitro_read_fan_rpm(struct device *dev,
 			      const struct nitro_ec_regs *regs, int channel,
@@ -391,7 +393,7 @@ static int nitro_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 					    : regs->gpu_fan_speed_ctrl, &raw);
 			if (ret)
 				return ret;
-			/* EC uses raw values 0-100; hwmon expects 0-255 */
+			/* Nominal raw 0-100 maps to hwmon 0-255; reads are not clamped. */
 			*val = (long)raw * 255 / 100;
 			nitro_dbg(dev, "%s pwm read: EC raw=%u (0-100) hwmon=%ld\n",
 				  channel == 0 ? "CPU" : "GPU", raw, *val);
