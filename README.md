@@ -1,94 +1,310 @@
 # acer-nitro-ec
 
-Linux kernel module (hwmon driver) that exposes Embedded Controller (EC) fan
-control and temperature sensors via the standard hwmon sysfs interface for
-Acer Nitro AN515/AN517 laptops.
+Linux Embedded Controller (EC) fan control for Acer Nitro laptops, with a
+standard hwmon interface, DKMS packaging, and a userspace fan controller.
+The current setup focuses on the **Acer Nitro AN515-57 running CachyOS**, with
+systemd, KDE Plasma, PolicyKit, and an optional keyd mapping for the Nitro key.
 
-## Supported models
+## Supported models and requirements
 
-- AN515-44, AN515-46, AN515-54, AN515-55, AN515-56, AN515-57, AN515-58
-- AN517-55
+The driver recognizes AN515-44, AN515-46, AN515-54, AN515-55, AN515-56,
+AN515-57, AN515-58, and AN517-55. The functional results documented here are
+for AN515-57; recognition does not imply equivalent testing on every model.
 
-## Features
+Build requirements: matching kernel headers, `make`, and an LLVM toolchain
+(`clang`, `llvm-ar`, etc.). The Makefile defaults to `LLVM=1` for kernels such
+as CachyOS; use `LLVM=0` for GCC-built kernels. The Arch/CachyOS packaging
+workflow also requires makepkg/base-devel and DKMS. Install headers for every
+kernel that DKMS should build for.
 
-- CPU and GPU fan speed readout (RPM)
-- PWM duty-cycle control (0–255)
-- Fan mode selection: Turbo / Manual / Auto
-- Temperature readings: CPU, GPU, System
+Userspace requires Bash, `flock` (util-linux), and `awk`; desktop integration
+uses systemd and PolicyKit. KDE helpers optionally use `kdialog` for errors
+and `notify-send` for notifications. Physical-key integration requires keyd;
+`libinput` tools are useful for diagnosing input events.
 
-## Requirements
+## Hardware details
 
-- Linux kernel headers for the running kernel
-- `make`
-- LLVM toolchain (`clang`, `llvm-ar`, …) — required by default for
-  LLVM-built kernels such as CachyOS; can be disabled with `LLVM=0`
+AN515-57 requires bit `0x10` in EC register `0x03` for manual fan control.
+The driver applies this enable quirk to AN515-57 and AN515-58 using a fresh
+read-modify-write (`current | 0x10`) to preserve unrelated bits. Separate EC
+reads and writes are not atomic against firmware or other drivers.
 
-## Build & install
+| Function | CPU | GPU |
+| --- | --- | --- |
+| Mode register | `0x22` | `0x21` |
+| Speed register | `0x37` | `0x3A` |
+| AUTO / MANUAL / TURBO values | `0x04` / `0x0C` / `0x08` | `0x10` / `0x30` / `0x20` |
+| RPM low / high bytes | `0x13` / `0x14` | `0x15` / `0x16` |
+
+RPM is `(high << 8) | low`. PWM intentionally maps hwmon **0–255** to EC raw
+**0–100**, using integer arithmetic:
+
+- Write: `raw = val * 100 / 255`.
+- Read: `val = raw * 255 / 100`.
+
+AN515-57 measurements were approximately CPU/GPU 3797/4477 RPM at raw 50,
+4109/4761 at raw 60, 4615/5454 at raw 80, and 4838/5769 at raw 90.
+Raw values at or above 100 produced approximately maximum fan speed.
+These are observations, not guaranteed RPM targets or percentages of RPM.
+
+## Driver behavior and safety
+
+Firmware **AUTO** is the default/recommended idle mode. hwmon mode values are
+`2` = AUTO, `1` = MANUAL, and `0` = TURBO. TURBO is distinct from the userspace
+`max` profile, which uses MANUAL with PWM 255.
+
+MANUAL has a **five-second lease per fan**. Successful PWM writes renew that
+fan's lease; expiry of either lease attempts to restore **both** fans to AUTO.
+Failed AUTO restoration blocks control writes and is retried by delayed work.
+TURBO is not leased. MANUAL must be explicitly reacquired after fallback.
+A mutex serializes control writes, lease handling, and lifecycle transitions.
+
+Remove, shutdown, and suspend block writes, invalidate leases, drain delayed
+work, and attempt AUTO for both fans even if the first write fails. Remove and
+shutdown retry up to three times. Suspend reports an error if AUTO restoration
+fails and resumes recovery scheduling on the awake device.
+
+Resume rechecks the EC fan-control feature bit. It intentionally does **not**
+restore previous MANUAL mode or PWM settings. The reported AN515-57 test began
+in MANUAL/MAX: suspend returned both fans to AUTO, and both remained AUTO after
+resume. Removal, service start/stop, and both toggle directions were also
+functionally tested. These results are historical, as recorded in [AGENTS.md](AGENTS.md).
+
+The kernel lease is the final failsafe if userspace dies, including SIGKILL,
+which cannot run shell cleanup. AUTO restoration still depends on working EC
+access; inspect errors instead of assuming every restoration succeeded.
+
+## Build and DKMS installation
+
+Run the following examples from the repository root. Installation and control
+commands change the system; run them deliberately after reviewing the changes.
+Do not use `ec_sys` concurrently with `acer_nitro_ec`.
+
+`acer-nitro-ec.c` is the canonical driver source. `Makefile` and `dkms.conf`
+are the canonical build/configuration files. Do not edit generated copies in
+`src/`, `pkg/`, or old archives. Inspect diffs before installing kernel changes:
 
 ```bash
-# Build (LLVM=1 is the default)
-make
-
-# Build without LLVM (GCC kernels)
-make LLVM=0
-
-# Install to the running kernel's module tree
-sudo make install
+git diff --check
+git diff -- acer-nitro-ec.c Makefile dkms.conf PKGBUILD
+make                  # LLVM=1 by default
+# Alternative for GCC-built kernels:
+# make LLVM=0
 ```
 
-## DKMS (auto-rebuild on kernel updates)
+For Arch/CachyOS, use the current local-source `PKGBUILD`:
 
 ```bash
-# Set the version in dkms.conf
-VERSION=1.0.0
-
-# Copy sources and register
-sudo cp -r . /usr/src/acer-nitro-ec-$VERSION
-sudo sed -i "s/@PKGVER@/$VERSION/" /usr/src/acer-nitro-ec-$VERSION/dkms.conf
-sudo dkms add    acer-nitro-ec/$VERSION
-sudo dkms build  acer-nitro-ec/$VERSION
-sudo dkms install acer-nitro-ec/$VERSION
+makepkg -s            # Run as your regular user; build the package
+sudo pacman -U ./acer-nitro-ec-dkms-1.0.0-1-any.pkg.tar.zst
+dkms status
 ```
+
+The package installs only the canonical driver, Makefile, and DKMS configuration
+to `/usr/src/acer-nitro-ec-1.0.0/`. Packaging replaces `@PKGVER@` with `1.0.0`
+in the staged `dkms.conf`, leaving the repository template unchanged.
+`sha256sums=('SKIP' 'SKIP' 'SKIP')` is intentional for local development;
+the package does not download a release archive. DKMS uses the installed
+`/usr/src` copy: editing the clone does not update installed sources or an
+already loaded module. Rebuild/reinstall after source changes and verify the
+DKMS results for each intended kernel.
+
+With Secure Boot enabled, configure DKMS signing with a key trusted by the
+machine before loading the module. The recorded setup uses the sbctl Database
+Key, with version 1.0.0 installed for `7.2.4-1-cachyos` and
+`6.18.50-1-cachyos-lts`. Those are historical local versions, not prerequisites
+or a signing configuration supplied by this repository.
+
+After successful installation/signing, load the module if not already loaded:
+
+```bash
+sudo modprobe acer-nitro-ec
+```
+
+For a non-DKMS manual installation, the Makefile also supports `sudo make install`
+(after building, with `LLVM=0` if needed). It runs `modules_install` and `depmod`;
+it does not provide DKMS rebuilds or configure Secure Boot signing. Choose one
+installation method rather than mixing manual and DKMS copies.
+
+## Install userspace and desktop files
+
+The DKMS package does not install the controller, helpers, service, or launchers.
+These commands show their installation destinations:
+
+```bash
+sudo install -Dm755 nitro-fan /usr/local/bin/nitro-fan
+sudo install -Dm755 nitro-fan-gaming-start /usr/local/bin/nitro-fan-gaming-start
+sudo install -Dm755 nitro-fan-auto /usr/local/bin/nitro-fan-auto
+sudo install -Dm755 nitro-fan-toggle /usr/local/bin/nitro-fan-toggle
+sudo install -Dm644 nitro-fan-gaming.service /etc/systemd/system/nitro-fan-gaming.service
+sudo install -Dm644 nitro-fan-gaming.desktop /usr/local/share/applications/nitro-fan-gaming.desktop
+sudo install -Dm644 nitro-fan-auto.desktop /usr/local/share/applications/nitro-fan-auto.desktop
+sudo install -Dm644 nitro-fan-toggle.desktop /usr/local/share/applications/nitro-fan-toggle.desktop
+sudo systemctl daemon-reload
+```
+
+Repository edits do not update these installed copies. The service is on-demand;
+do **not** enable it at boot. It intentionally has no `[Install]` section.
+
+## nitro-fan userspace tool
+
+```bash
+nitro-fan status       # Read-only modes, PWM, RPM, and temperatures
+sudo nitro-fan gaming # Foreground dynamic curve; Ctrl+C restores AUTO
+sudo nitro-fan auto   # Restore both fans to firmware AUTO
+sudo nitro-fan max    # Foreground MANUAL PWM 255; Ctrl+C restores AUTO
+```
+
+Run one control command at a time. Controllers share `/run/nitro-fan.lock`;
+`status` does not take the lock. Stop a foreground gaming/max process with
+Ctrl+C before running `auto`. If gaming is running as a service, use
+`nitro-fan-auto` to stop it; `sudo nitro-fan auto` does not stop the service and
+will encounter its lock. The Auto helper does not stop an unrelated foreground
+controller.
+
+Gaming and max refresh both PWM values every second to renew the leases, even
+when the target is unchanged. Cleanup attempts both AUTO writes on exit,
+SIGINT, or SIGTERM. Loss of MANUAL causes an exit with AUTO cleanup; restart
+explicitly to regain control. MAX is an explicit manual choice and is never
+selected automatically.
+
+## Gaming curve
+
+Gaming uses the **hotter of CPU/GPU**, applying the same target to both fans:
+
+| Temperature | Requested hwmon PWM |
+| --- | --- |
+| <55 C | 178 |
+| 55–64 C | 191 |
+| 65–74 C | 204 |
+| 75–84 C | 217 |
+| >=85 C | 230 |
+
+Upward changes use these thresholds immediately. **3 C downward hysteresis**
+requires temperature strictly below the crossed threshold minus 3 C before
+reducing a step; for example, the 65 C step drops only below 62 C. Several
+steps can be crossed in one update. Gaming never selects PWM 255.
+
+## systemd and KDE integration
+
+`nitro-fan-gaming.service` runs `/usr/local/bin/nitro-fan gaming` as root,
+on demand, with `Restart=no`. Stopping sends SIGTERM so shell cleanup restores
+AUTO; the unit disables a subsequent SIGKILL. The kernel lease remains the
+fallback if PWM refreshes stop.
+
+| Helper | Behavior |
+| --- | --- |
+| `nitro-fan-gaming-start` | Start the gaming service |
+| `nitro-fan-auto` | Stop the service, then verify both fans report AUTO; allow up to six seconds for lease fallback |
+| `nitro-fan-toggle` | Inactive service -> gaming; active service -> AUTO |
+
+Start/stop helpers call `/usr/bin/systemctl --system` directly, without `pkexec`.
+The toggle checks `systemctl --system is-active --quiet` and delegates to the
+existing helpers; it does not duplicate fan control or write sysfs directly.
+
+After installing the launchers, KDE offers **Nitro Fans: Gaming**, **Nitro Fans:
+Auto**, and **Nitro Fans: Toggle**. Desktop launchers and the helper commands
+remain fallback controls when the physical key is unavailable.
+
+## PolicyKit setup
+
+[extras/polkit/49-nitro-fan.rules](extras/polkit/49-nitro-fan.rules) authorizes
+only `start` and `stop` of `nitro-fan-gaming.service` through
+`org.freedesktop.systemd1.manage-units` for user `branislavb`. Adjust that
+installation-specific username before installing for another user.
+
+Example installation, after reviewing/editing the template:
+
+```bash
+sudo install -Dm644 extras/polkit/49-nitro-fan.rules /etc/polkit-1/rules.d/49-nitro-fan.rules
+```
+
+With the rule active, service start/stop through the helpers no longer requires
+a password prompt. This is not generic passwordless sudo/root access and does
+not authorize the direct `sudo nitro-fan ...` commands. Keep the installed rule
+owned by root and review its exact unit, username, and verbs.
+
+## Physical Nitro key
+
+The tested built-in device is **AT Translated Set 2 keyboard**, keyd id
+`0001:0001:093d12dc`. keyd detects the physical Nitro key as **F16**.
+[extras/keyd/nitro.conf](extras/keyd/nitro.conf) targets that id and maps
+`f16 = f24`; F24 is intentionally the KDE-visible shortcut key. External
+keyboards with different ids are unaffected because this is not a wildcard
+keyboard configuration.
+
+After installing keyd through your distribution, inspect existing keyd
+configuration for conflicting mappings, then install the template:
+
+```bash
+sudo install -Dm644 extras/keyd/nitro.conf /etc/keyd/nitro.conf
+sudo systemctl enable --now keyd
+sudo systemctl restart keyd
+```
+
+In KDE System Settings -> Shortcuts, add a command shortcut for
+`/usr/local/bin/nitro-fan-toggle` and assign **F24** by pressing the Nitro key
+after the keyd mapping is active. The KDE shortcut is a separate per-user
+setting; it is not installed by the template. The tested path is:
+physical Nitro key -> F16 -> keyd F24 -> KDE -> toggle helper -> service.
 
 ## Sysfs interface
 
-After loading, the following files are available under
-`/sys/class/hwmon/hwmonX/` (find the right `hwmonX` with
-`grep -l acer_nitro_ec /sys/class/hwmon/*/name`):
+The driver exposes these files under `/sys/class/hwmon/hwmonX/`. Discover the
+device by `name=acer_nitro_ec`; never hardcode the hwmon number. `nitro-fan`
+discovers it automatically and rejects an ambiguous match.
 
-| File          | Access | Description                                   |
-| ------------- | ------ | --------------------------------------------- |
-| `fan1_input`  | r      | CPU fan speed (RPM)                           |
-| `fan2_input`  | r      | GPU fan speed (RPM)                           |
-| `pwm1`        | rw     | CPU fan duty cycle (0–255)                    |
-| `pwm2`        | rw     | GPU fan duty cycle (0–255)                    |
-| `pwm1_enable` | rw     | CPU fan mode: `0`=Turbo, `1`=Manual, `2`=Auto |
-| `pwm2_enable` | rw     | GPU fan mode: `0`=Turbo, `1`=Manual, `2`=Auto |
-| `temp1_input` | r      | CPU temperature (m°C)                         |
-| `temp2_input` | r      | GPU temperature (m°C)                         |
-| `temp3_input` | r      | System temperature (m°C)                      |
+| File | Access | Description |
+| --- | --- | --- |
+| `fan1_input` | r | CPU fan speed (RPM) |
+| `fan2_input` | r | GPU fan speed (RPM) |
+| `pwm1` | rw | CPU PWM (0–255) |
+| `pwm2` | rw | GPU PWM (0–255) |
+| `pwm1_enable` | rw | CPU mode: `0` TURBO, `1` MANUAL, `2` AUTO |
+| `pwm2_enable` | rw | GPU mode: `0` TURBO, `1` MANUAL, `2` AUTO |
+| `temp1_input` | r | CPU temperature (millidegrees C) |
+| `temp2_input` | r | GPU temperature (millidegrees C) |
+| `temp3_input` | r | System temperature (millidegrees C) |
 
-Example — set CPU fan to manual at ~50% and read current speed:
+Use the lease-aware controller instead of one-shot manual sysfs writes.
+
+## Verification and troubleshooting
 
 ```bash
-HWMON=/sys/class/hwmon/$(grep -l acer_nitro_ec /sys/class/hwmon/*/name | cut -d/ -f5)
-echo 1   | sudo tee $HWMON/pwm1_enable   # manual mode
-echo 128 | sudo tee $HWMON/pwm1          # ~50% duty cycle
-cat $HWMON/fan1_input                    # current RPM
+nitro-fan status
+systemctl status nitro-fan-gaming.service
+journalctl -u nitro-fan-gaming.service
+sudo keyd monitor
+sudo libinput debug-events --show-keycodes
 ```
 
-## Debug / logging
+The input monitors help distinguish the physical F16 event from the remapped
+F24 event. Stop monitoring with Ctrl+C. An inactive gaming service is normal
+in AUTO. If a shortcut does nothing, check the device id/mapping, KDE F24
+binding, installed helper paths, and the username/unit/verbs in the PolicyKit
+rule. Use the desktop or terminal helpers to isolate shortcut problems.
+
+If hwmon is missing, check module loading, matching kernel headers, `dkms status`,
+Secure Boot trust/signing, and kernel logs. After suspend/resume or lease
+fallback, expect AUTO and explicitly start gaming again if wanted. Do not
+remove the control lock file to bypass an active controller.
+
+PWM readback may differ slightly from the requested value because both
+0–255 <-> 0–100 conversions truncate: requesting 178 writes raw 69, which reads
+back as 175. This is expected and is not evidence that the curve failed.
+
+For driver logging, load with `sudo modprobe acer-nitro-ec debug=1` when the
+module is not already loaded, or enable dynamic debug without reloading:
 
 ```bash
-# Enable verbose logging at load time
-sudo modprobe acer-nitro-ec debug=1
-
-# Or enable dynamic_debug at runtime (no reload needed)
 echo "module acer_nitro_ec +p" | sudo tee /sys/kernel/debug/dynamic_debug/control
-
-# Watch kernel messages
 sudo dmesg -w | grep acer-nitro-ec
 ```
+
+Before installing kernel changes, inspect diffs. Never use `ec_sys` alongside
+this driver. Arrange AUTO restoration before hardware tests, keep MAX manual-only,
+and verify AUTO when stopping control. The lease is a fallback, not a reason
+to omit normal cleanup.
 
 ## Credits
 
