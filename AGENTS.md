@@ -23,8 +23,9 @@
   `/etc/systemd/system/acer-wmi-battery-health.service`: `Type=oneshot`,
   writes `1` to `health_mode`, uses `RemainAfterExit=yes`, and is enabled
   at `multi-user.target`.
-- Current reported validation: service enabled, `active (exited)`,
+- Final user-reported post-reboot validation: service enabled, `active (exited)`,
   ExecStart `status=0/SUCCESS`, and `health_mode` remained `1`.
+  This confirms the battery health boot persistence setup works.
 
 ## EC discoveries and current encoding
 - AN515-57 requires bit `0x10` in EC register `0x03` for manual fan control.
@@ -233,6 +234,22 @@
 - Gaming service was run briefly. Journal checks for "fan speed set" produced
   no routine PWM messages, and both fans ended in AUTO.
 
+## Final post-reboot validation
+- These completed results are user-reported after a full reboot; they do not
+  authorize repeating hardware tests or changing the installed setup.
+- The system came up correctly on kernel `7.2.5-1-cachyos`.
+- `acer_nitro_ec` auto-loaded successfully from
+  `/lib/modules/7.2.5-1-cachyos/updates/dkms/acer-nitro-ec.ko.zst`.
+  Loaded srcversion: `7738B727383C0017DB7A471`; signer: `Database Key`.
+- Both CPU and GPU fans were in firmware AUTO, and
+  `nitro-fan-gaming.service` was inactive.
+- Observed post-reboot status example: CPU approximately 44–45 C,
+  GPU approximately 41 C, and system sensor approximately 75–76 C.
+- hwmon discovery resolved to `hwmon5` during this boot only. Dynamic discovery
+  by `name=acer_nitro_ec` remains required; this is not a permanent device path.
+- Battery health persistence was confirmed as recorded above, and `keyd`
+  was active after reboot.
+
 ## Safety rules for future work
 - Do not use `ec_sys` concurrently with `acer_nitro_ec`.
 - Discover hwmon by `name=acer_nitro_ec`; never hardcode a `hwmonX` number.
@@ -246,8 +263,11 @@
 
 ## Git checkpoint and release state
 - Before this documentation update, the working tree was clean; local `main`
-  and cached `origin/main` pointed to `c01daaf`. No remote fetch was performed.
+  and cached `origin/main` pointed to `5a2d18d`, with tag `v1.1.0` at that
+  commit. No remote fetch was performed.
 - Latest relevant commits, verified from local history:
+  - `5a2d18d` — Prepare v1.1.0 release.
+  - `5e9cb88` — Clarify driver behavior and release documentation.
   - `c01daaf` — Harden fan toggle and reduce PWM logging.
   - `506418b` — Update project context and battery health setup.
   - `5a30e4c` — Fail safely on unknown fan modes and cleanup errors.
@@ -257,12 +277,17 @@
 - The two previous release-blocking safety findings are fixed, committed,
   built, installed, and runtime-validated on `7.2.5-1-cachyos` as described
   above; failure-path tests remain static/mocked rather than hardware-induced.
-- The current setup has not been tagged for release. A pre-existing `v1.0.0`
-  tag already points to older commit `47026ba` (Fix dkms.conf: remove deprecated
-  REMAKE_INITRD), not the current safety-fixed checkpoint. Do not confuse this
-  older tag with a release of the completed setup.
+- Release `v1.1.0` is now published (user-reported publication), and is the
+  current completed release. Release title: `acer-nitro-ec v1.1.0`.
+  Tag `v1.1.0` points to release commit `5a2d18d`, verified from local Git.
+- Arch/CachyOS release asset: `acer-nitro-ec-dkms-1.1.0-1-any.pkg.tar.zst`.
+  Package SHA256:
+  `7ea84eca9456771750d0b3cc153b2bae7db39236bf9384572ea6ec2acc5c8b46`.
+- Local Git tags are `v1.0.0` and `v1.1.0`. The existing `v1.0.0` remains
+  unchanged at older commit `47026ba` (Fix dkms.conf: remove deprecated
+  REMAKE_INITRD), verified from local Git; it is not the current completed release.
 
-## Next planned work
+## Completed release and future work
 - Completed: routine PWM logging hardening, concurrency serialization, and
   750 ms debounce are implemented and runtime-validated. Toggle query-error
   handling is completed and covered by mocked tests.
@@ -273,5 +298,8 @@
   for confirmation; extra synchronization is not warranted for this setup.
 - Minor comment/documentation cleanup completed: RPM byte order, MANUAL-write
   lease renewal, unclamped PWM read assumptions, and loop timing are clarified.
-- Then perform the final release audit and decide the release/tag strategy,
-  accounting for the existing older `v1.0.0` tag. Do not tag automatically.
+- Final release audit passed, no release blockers remained, and `v1.1.0`
+  was published.
+- The current low-level fan-control setup is considered a known-good checkpoint.
+  Future work is post-`v1.1.0` development, not unfinished release work.
+  Do not tag automatically.
