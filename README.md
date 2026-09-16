@@ -101,12 +101,12 @@ For Arch/CachyOS, use the current local-source `PKGBUILD`:
 
 ```bash
 makepkg -s            # Run as your regular user; build the package
-sudo pacman -U ./acer-nitro-ec-dkms-1.0.0-1-any.pkg.tar.zst
+sudo pacman -U ./acer-nitro-ec-dkms-1.1.0-1-any.pkg.tar.zst
 dkms status
 ```
 
 The package installs only the canonical driver, Makefile, and DKMS configuration
-to `/usr/src/acer-nitro-ec-1.0.0/`. Packaging replaces `@PKGVER@` with `1.0.0`
+to `/usr/src/acer-nitro-ec-1.1.0/`. Packaging replaces `@PKGVER@` with `1.1.0`
 in the staged `dkms.conf`, leaving the repository template unchanged.
 `sha256sums=('SKIP' 'SKIP' 'SKIP')` is intentional for local development;
 the package does not download a release archive. DKMS uses the installed

@@ -51,11 +51,11 @@
 - `./acer-nitro-ec.c` is the canonical driver source. `./Makefile` and
   `./dkms.conf` are the canonical build/configuration files.
 - `PKGBUILD` packages those three local files, not the GitHub release archive.
-  Package identity remains `acer-nitro-ec-dkms`, version `1.0.0`, release `1`.
+  Package identity remains `acer-nitro-ec-dkms`, version `1.1.0`, release `1`.
 - `sha256sums=('SKIP' 'SKIP' 'SKIP')` is intentional for local development.
-- Files are staged into `$pkgdir/usr/src/acer-nitro-ec-1.0.0/`; packaging
-  substitutes `@PKGVER@` with `1.0.0` in the staged `dkms.conf` only.
-- Package installation populates `/usr/src/acer-nitro-ec-1.0.0/`, which is
+- Files are staged into `$pkgdir/usr/src/acer-nitro-ec-1.1.0/`; packaging
+  substitutes `@PKGVER@` with `1.1.0` in the staged `dkms.conf` only.
+- Package installation populates `/usr/src/acer-nitro-ec-1.1.0/`, which is
   DKMS's source. Editing the repository does not automatically update it.
 - `src/`, `pkg/`, archives, and module build outputs are generated artifacts,
   not development sources; old nested copies may be stale.

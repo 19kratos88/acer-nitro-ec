@@ -1,6 +1,6 @@
 # Maintainer: OrnelasD-Rogers <https://github.com/OrnelasD-Rogers>
 pkgname=acer-nitro-ec-dkms
-pkgver=1.0.0
+pkgver=1.1.0
 pkgrel=1
 pkgdesc="Acer Nitro AN515/AN517 EC fan control driver (hwmon, DKMS)"
 arch=('any')
