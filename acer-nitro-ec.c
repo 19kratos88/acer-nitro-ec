@@ -408,15 +408,19 @@ static int nitro_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 					*val = 0;
 				else if (raw == CPU_MANUAL_MODE)
 					*val = 1;
-				else
+				else if (raw == CPU_AUTO_MODE)
 					*val = 2; /* auto */
+				else
+					return -EIO;
 			} else {
 				if (raw == GPU_TURBO_MODE)
 					*val = 0;
 				else if (raw == GPU_MANUAL_MODE)
 					*val = 1;
-				else
+				else if (raw == GPU_AUTO_MODE)
 					*val = 2; /* auto */
+				else
+					return -EIO;
 			}
 			nitro_dbg(dev,
 				  "%s mode read: EC=0x%02X -> pwm_enable=%ld "

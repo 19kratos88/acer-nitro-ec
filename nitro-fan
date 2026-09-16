@@ -110,7 +110,8 @@ cleanup() {
     # Keep cleanup from being interrupted by another INT/TERM.
     trap '' INT TERM
     if ! restore_auto; then
-        (( result != 0 )) || result=1
+        # Override even signal statuses accepted by the systemd service.
+        result=1
     fi
     exit "$result"
 }
